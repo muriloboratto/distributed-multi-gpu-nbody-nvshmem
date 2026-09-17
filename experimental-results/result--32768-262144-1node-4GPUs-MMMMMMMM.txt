@@ -1,0 +1,24 @@
+n_body node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+
+N-Body | Libraries=MMMMMMMM | Bodies=32768 | Average Time (s): 0.011360
+n_body node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+
+N-Body | Libraries=MMMMMMMM | Bodies=65536 | Average Time (s): 0.017059
+n_body node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+
+N-Body | Libraries=MMMMMMMM | Bodies=131072 | Average Time (s): 0.044364
+n_body node=sdumont8046 MPI=1/4 NVSHMEM=1/4 device=1:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=3/4 NVSHMEM=3/4 device=3:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=2/4 NVSHMEM=2/4 device=2:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+n_body node=sdumont8046 MPI=0/4 NVSHMEM=0/4 device=0:Tesla V100-SXM2-32GB libraries=MMMMMMMM
+
+N-Body | Libraries=MMMMMMMM | Bodies=262144 | Average Time (s): 0.160075
