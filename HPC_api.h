@@ -79,4 +79,22 @@ void BROADCAST(OperationType type, MemoryType *mem, MemoryType *res, ProcessInfo
 void BROADCAST_PROC(OperationType type, MemoryType *mem, MemoryType *res, ProcessInformation *proc, Communicator *comm, int processor_num);
 void GATHER(OperationType type, MemoryType *mem, MemoryType *res, ProcessInformation *proc, Communicator *comm);
 
+void reference_force(const double *posX,
+                     const double *posY,
+                     const double *mass,
+                     int n,
+                     int target,
+                     double *fx,
+                     double *fy);
+
+int validate_nbody_sampled(const MemoryType *posX,
+                           const MemoryType *posY,
+                           const MemoryType *mass,
+                           const MemoryType *forceX,
+                           const MemoryType *forceY,
+                           int number_of_bodies,
+                           int max_samples,
+                           double rel_tolerance,
+                           double abs_tolerance);
+
 #endif

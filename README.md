@@ -2,58 +2,53 @@
 
 ![Scheme](img/1.png)
 
-Each body is represented by:
+This project implements a distributed **N-body benchmark for multi-GPU systems**. It uses **one MPI process per GPU** and provides four communication alternatives:
 
-- its X position, `posX`;
-- its Y position, `posY`;
-- its mass, `mass`.
+| Code | Communication mechanism |
+|---|---|
+| `M` | MPI |
+| `C` | CUDA-Aware MPI |
+| `N` | NCCL |
+| `S` | NVSHMEM |
 
-The resulting force components are stored in:
+A complete configuration contains exactly eight characters. Homogeneous examples are:
 
-- `forceX`;
-- `forceY`.
+```text
+MMMMMMMM = MPI
+CCCCCCCC = CUDA-Aware MPI
+NNNNNNNN = NCCL
+SSSSSSSS = NVSHMEM
+```
 
-For a local body \(i\), the CUDA kernel evaluates its interaction with the bodies \(j\) in the currently available particle partition:
+The eight positions select the mechanisms used for the three initial distributions, three partition exchanges, and two final force collections. Mixed configurations are accepted by the generic communication path. The all-NVSHMEM configuration (`SSSSSSSS`) uses a dedicated optimized execution path with **one-sided communication, asynchronous prefetching, double buffering, and communication/computation overlap**.
 
+Each body is represented by its X and Y positions and mass. For a local body \(i\), the force contribution from body \(j\) is computed from
 
-$dx = x_i - x_j$
-
-
-
-$dy = y_i - y_j$
-
-
-
-$d = \sqrt{dx^2 + dy^2}$
-
-
-and accumulates:
+$$dx=x_i-x_j, \qquad dy=y_i-y_j, \qquad d=\sqrt{dx^2+dy^2}$$
 
 
-$F_x \mathrel{+}= \frac{dx\,m_j}{d^3}$
+and accumulated as
 
+$$
+F_x \mathrel{+}= \frac{dx\,m_j}{d^3}, \qquad
+F_y \mathrel{+}= \frac{dy\,m_j}{d^3}.
+$$
 
+Self-interaction is skipped when the source and local partitions are the same.
 
-$F_y \mathrel{+}= \frac{dy\,m_j}{d^3}$
-
-
-When the local and source particle partitions are the same, the interaction of a particle with itself is skipped.
-
-The global particle arrays are divided equally among the MPI processes. Therefore:
+The global arrays are divided equally among MPI processes:
 
 ```text
 local_size = number_of_bodies / number_of_processes
 ```
 
-The current program requires `number_of_bodies` to be positive and exactly divisible by the number of MPI processes.
+Therefore, `number_of_bodies` must be positive and exactly divisible by the number of MPI processes.
 
 ---
 
 ## 2. Parallel Execution Model
 
-The application follows a **one MPI process per GPU** model.
-
-For a four-GPU execution:
+The benchmark follows a **one MPI process per GPU** model. For four GPUs:
 
 ```text
 MPI Rank 0  <-->  NVSHMEM PE 0  <-->  GPU 0
@@ -62,39 +57,19 @@ MPI Rank 2  <-->  NVSHMEM PE 2  <-->  GPU 2
 MPI Rank 3  <-->  NVSHMEM PE 3  <-->  GPU 3
 ```
 
-MPI is initialized first. NVSHMEM is then initialized with `MPI_COMM_WORLD` through:
+MPI is initialized first. NVSHMEM is initialized with `MPI_COMM_WORLD` using:
 
 ```cpp
 nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
 ```
 
-During communicator creation, the program verifies that:
-
-```text
-MPI rank       == NVSHMEM PE
-MPI processes  == NVSHMEM PEs
-```
-
-If this mapping is not satisfied, the application aborts.
-
-Rank 0 also creates the NCCL unique ID, distributes it with `MPI_Bcast`, and each process initializes its NCCL communicator.
+The program verifies that MPI ranks and NVSHMEM PEs have identical mappings. NCCL is also initialized for the processes so the same executable can exercise MPI, CUDA-Aware MPI, NCCL, and NVSHMEM communication paths.
 
 ---
 
 ## 3. Communication Configuration
 
-The communication mechanism is selected independently for eight communication operations.
-
-The available codes are:
-
-| Code | Communication Mechanism |
-| ---- | ----------------------- |
-| `M` | MPI |
-| `C` | CUDA-Aware MPI |
-| `N` | NCCL |
-| `S` | NVSHMEM |
-
-The configuration must contain **exactly eight characters**:
+The eight communication positions are interpreted as:
 
 ```text
 communication_libraries[0] -> Scatter posX
@@ -109,377 +84,252 @@ communication_libraries[6] -> Gather forceX
 communication_libraries[7] -> Gather forceY
 ```
 
-Examples:
+For MPI, CUDA-Aware MPI, NCCL, or mixed configurations, `n_body()` uses the generic communication abstraction implemented in `HPC_api.c` through `SCATTER()`, `BROADCAST_PROC()`, and `GATHER()`.
 
-```text
-MMMMMMMM -> MPI
-CCCCCCCC -> CUDA-Aware MPI
-NNNNNNNN -> NCCL
-SSSSSSSS -> NVSHMEM
-```
-
-Mixed configurations are also accepted by the command-line parser, for example:
-
-```text
-CCCSSSCC
-SSSNNNSS
-```
-
-Each position is interpreted independently by the communication API.
+When all eight positions are `S`, `n_body()` dispatches to the specialized `n_body_nvshmem()` implementation instead of the generic path.
 
 ---
 
-## 4. Execution Flow
+## 4. Generic Execution Flow
 
-The N-body execution can be summarized as:
-
-```text
-               Global Particle Data
-              posX / posY / mass
-                       |
-                       v
-              +----------------+
-              |    SCATTER     |
-              +----------------+
-                       |
-                       v
-             Local particle data
-             posXl / posYl / massl
-                       |
-                       v
-             forceXl = forceYl = 0
-                       |
-                       v
-          +--------------------------+
-          | for each partition owner |
-          +--------------------------+
-                       |
-              +--------+--------+
-              |                 |
-              v                 v
-        Local partition    Remote partition
-              |                 |
-              |           BROADCAST_PROC
-              |          or NVSHMEM GET
-              |                 |
-              +--------+--------+
-                       |
-                       v
-                CUDA N-body kernel
-                       |
-                       v
-             Accumulate local forces
-              forceXl / forceYl
-                       |
-                       v
-              +----------------+
-              |     GATHER     |
-              +----------------+
-                       |
-                       v
-                forceX / forceY
-```
-
-The communication can therefore be divided into three principal stages.
-
-### Stage 1 — Initial Particle Distribution
-
-The global arrays:
+The MPI, CUDA-Aware MPI, NCCL, and mixed execution path follows:
 
 ```text
-posX
-posY
-mass
+Global posX / posY / mass
+          |
+          v
+       SCATTER
+          |
+          v
+Local posXl / posYl / massl
+          |
+          v
+forceXl = forceYl = 0
+          |
+          v
++---------------------------+
+| for each partition owner  |
++---------------------------+
+          |
+          +--> local partition
+          |
+          +--> remote partition -> BROADCAST_PROC
+          |
+          v
+  tiled CUDA N-body kernel
+          |
+          v
+ accumulate forceXl/forceYl
+          |
+          v
+        GATHER
+          |
+          v
+    forceX / forceY
 ```
 
-are partitioned among the processes using `SCATTER()`.
-
-Each process obtains:
-
-```text
-posXl
-posYl
-massl
-```
-
-with `N/P` elements.
-
-### Stage 2 — Particle-Partition Exchange
-
-Each MPI rank iterates over all partition owners.
-
-For a remote owner, the position and mass arrays are made available through `BROADCAST_PROC()`.
-
-For MPI, CUDA-Aware MPI, and NCCL, this stage uses collective communication semantics.
-
-For NVSHMEM, a process obtains the selected owner's particle partition through a **one-sided GET** operation.
-
-The CUDA kernel then calculates the contribution of that partition to the forces acting on the local bodies.
-
-### Stage 3 — Force Collection
-
-After every particle partition has been processed, the local arrays:
-
-```text
-forceXl
-forceYl
-```
-
-are collected into:
-
-```text
-forceX
-forceY
-```
-
-through `GATHER()`.
+This path keeps the computational kernel fixed while changing the communication mechanism.
 
 ---
 
-## 5. Memory Model
+## 5. Optimized NVSHMEM Execution Path
 
-`MemoryType` maintains three memory representations:
+The homogeneous `SSSSSSSS` configuration uses a dedicated NVSHMEM path designed to reduce synchronization and overlap remote communication with GPU computation.
+
+### 5.1 One-sided GPU communication
+
+Remote particle partitions are obtained with stream-ordered nonblocking NVSHMEM GET operations:
 
 ```cpp
-void *addr_h;   // Host memory
-void *addr_d;   // CUDA device memory
-void *addr_s;   // NVSHMEM symmetric device memory
+nvshmemx_double_get_nbi_on_stream(...);
+nvshmemx_quiet_on_stream(...);
 ```
 
-Thus, each allocated data object contains:
+The consumer PE explicitly fetches the required remote partition from the owner's symmetric GPU memory. This differs from the collective communication model used by the other paths.
+
+### 5.2 Double buffering
+
+Two symmetric staging buffers are maintained for each remote particle field:
 
 ```text
-Host memory
-    |
-    | cudaMemcpy
-    v
-CUDA device memory
-    |
-    | device-to-device copy when required
-    v
-NVSHMEM symmetric device memory
+remotePosX[0] / remotePosX[1]
+remotePosY[0] / remotePosY[1]
+remoteMass[0] / remoteMass[1]
 ```
 
-`commMemory()` allocates:
+They are used in ping-pong order. While the compute stream consumes one buffer, the communication stream can prefetch the next remote partition into the other buffer.
 
-- host memory with `malloc`;
-- conventional GPU memory with `cudaMalloc`;
-- symmetric NVSHMEM memory with `nvshmem_malloc`.
+### 5.3 Communication/computation overlap
 
-The current NVSHMEM implementation intentionally keeps conventional CUDA memory (`addr_d`) separate from symmetric NVSHMEM memory (`addr_s`). Helper functions copy data between these two GPU-memory regions when required.
-
-This preserves the same CUDA computational kernel while introducing NVSHMEM at the communication layer.
-
----
-
-## 6. Communication Operations
-
-The abstraction is implemented by `HPC_api.c`.
-
-### 6.1 `SCATTER()`
-
-The initial particle distribution differs according to the selected mechanism.
-
-| Code | Implementation |
-| ---- | -------------- |
-| `M` | Device-to-host copy + `MPI_Scatter` + host-to-device copy |
-| `C` | `MPI_Scatter` directly using CUDA device pointers |
-| `N` | `ncclBroadcast` of the global array followed by a device-to-device copy of the local partition |
-| `S` | PE 0 publishes the global array in symmetric memory and each PE performs `nvshmem_double_get` for its own partition |
-
-For NVSHMEM:
+The pipeline is conceptually:
 
 ```text
-                       PE 0
-               Global symmetric array
-              +----+----+----+----+
-              | D0 | D1 | D2 | D3 |
-              +----+----+----+----+
-                |    |    |    |
-               GET  GET  GET  GET
-                |    |    |    |
-                v    v    v    v
-               PE0  PE1  PE2  PE3
+Time ------------------------------------------------------------>
+
+comm_stream:     GET P1          GET P2          GET P3
+                    |               |               |
+                    v               v               v
+buffers:          buffer 0        buffer 1        buffer 0
+
+compute_stream: LOCAL P0       COMPUTE P1      COMPUTE P2      COMPUTE P3
+                         <--- communication/computation overlap --->
 ```
 
-Each PE therefore transfers only its own partition.
-
----
-
-### 6.2 `BROADCAST_PROC()`
-
-This operation makes the particle partition belonging to a selected process available to the other processes.
-
-| Code | Implementation |
-| ---- | -------------- |
-| `M` | Host/device copies combined with `MPI_Bcast` |
-| `C` | `MPI_Bcast` directly using CUDA device memory |
-| `N` | `ncclBroadcast` |
-| `S` | One-sided `nvshmem_double_get` from the selected PE |
-
-For NVSHMEM, each PE first publishes its local partition at its symmetric address. A consumer that needs the partition of PE `p` executes conceptually:
+Two CUDA streams are used:
 
 ```text
-Consumer PE
-    |
-    | nvshmem_double_get
-    v
-Symmetric memory of PE p
+comm.comm_stream     -> NVSHMEM communication
+comm.compute_stream  -> CUDA N-body computation
 ```
 
-This is an important difference from the collective mechanisms:
+CUDA events enforce the producer/consumer dependencies:
 
 ```text
-MPI / CUDA-Aware MPI / NCCL
-        owner distributes data
-                 |
-                 v
-              receivers
-```
-
-whereas the NVSHMEM path uses:
-
-```text
-NVSHMEM
-       consumer requests remote data
-                 |
-                 v
-          owner's symmetric memory
-```
-
-This makes the NVSHMEM implementation particularly useful for experiments involving **data locality** and one-sided GPU communication.
-
----
-
-### 6.3 `GATHER()`
-
-The force arrays are collected after all particle partitions have been processed.
-
-| Code | Implementation |
-| ---- | -------------- |
-| `M` | Device-to-host copy + `MPI_Gather` + host-to-device copy on rank 0 |
-| `C` | `MPI_Gather` directly using CUDA device memory |
-| `N` | `ncclAllGather` |
-| `S` | PE 0 performs `nvshmem_double_get` for the local force array of every PE |
-
-The NVSHMEM implementation follows:
-
-```text
-PE 0 forceXl ----+
-PE 1 forceXl ----+
-PE 2 forceXl ----+----> GET by PE 0 ----> forceX
-PE 3 forceXl ----+
-```
-
-and equivalently for `forceY`.
-
----
-
-## 7. NVSHMEM Synchronization
-
-The NVSHMEM communication path uses:
-
-```cpp
-nvshmem_barrier_all();
-nvshmem_quiet();
-```
-
-to coordinate publication and completion of symmetric-memory operations.
-
-The general pattern is:
-
-```text
-Publish local data
-       |
-       v
-nvshmem_barrier_all()
-       |
-       v
-nvshmem_double_get()
-       |
-       v
-nvshmem_quiet()
-       |
-       v
-Copy symmetric data to CUDA buffer when required
-       |
-       v
-nvshmem_barrier_all()
-```
-
-The current implementation uses **host-initiated NVSHMEM operations**. NVSHMEM communication is therefore separated from the CUDA force kernel.
-
----
-
-## 8. GPU Computation
-
-The CUDA computation is implemented in:
-
-```text
-n_body_kernel.cu
-```
-
-through:
-
-```cpp
-partial_n_body_kernel()
-```
-
-and the wrapper:
-
-```cpp
-calculate_force()
-```
-
-Each CUDA thread processes one local body:
-
-```text
-CUDA thread
+GET partition
      |
      v
-Local particle i
-     |
-     +---- interaction with particle 0
-     +---- interaction with particle 1
-     +---- interaction with particle 2
-     +---- ...
-     +---- interaction with particle N/P - 1
+ready[buffer]
      |
      v
-forceXl[i] / forceYl[i]
+compute partition
+     |
+     v
+consumed[buffer]
+     |
+     v
+buffer can be reused
 ```
 
-The kernel accumulates force contributions using:
+The `ready[]` events prevent computation from reading an incomplete transfer, while `consumed[]` prevents the communication stream from overwriting a staging buffer that is still being consumed.
+
+### 5.4 Final force publication
+
+After computation, each PE publishes its local force partition into PE 0's symmetric result arrays with:
 
 ```cpp
-forceX[part_index] += ...
-forceY[part_index] += ...
+nvshmemx_double_put_nbi_on_stream(...);
 ```
 
-For this reason, `n_body()` explicitly resets the local force arrays before processing the partitions:
+PE 0 then updates the host copies of `forceX` and `forceY`, which are used for reporting and numerical validation.
 
-```cpp
-cudaMemset(forceXl.addr_d, 0, ...);
-cudaMemset(forceYl.addr_d, 0, ...);
-```
+---
 
-When the source partition is the local partition, the `same` argument prevents self-interaction.
+## 6. GPU Computation and Shared-Memory Tiling
 
-The current CUDA block width is:
+The CUDA kernel is implemented in `n_body_kernel.cu` by `partial_n_body_kernel()` and launched through `calculate_force()`.
+
+The current block width is:
 
 ```cpp
 #define TILE_DIM 256
 ```
 
-and is passed to `calculate_force()`.
+The kernel **implements shared-memory tiling**. For each source tile it allocates shared arrays for positions and masses:
 
-> **Note:** despite the name `TILE_DIM`, the current kernel does not implement shared-memory tiling. It is used as the CUDA thread-block width.
+```cpp
+extern __shared__ double shared[];
+
+double *sPosX = shared;
+double *sPosY = &shared[blockDim.x];
+double *sMass = &shared[2 * blockDim.x];
+```
+
+A tile is loaded from GPU memory into shared memory and reused by the threads in the CUDA block:
+
+```text
+Global/symmetric GPU memory
+            |
+            | load source tile
+            v
++-----------------------------+
+|       CUDA shared memory    |
+|    posX | posY | mass       |
++-----------------------------+
+            |
+            | reused by block threads
+            v
+   local-body force updates
+```
+
+This reduces repeated accesses to the source particle arrays during the $(O(N^2)$ interaction computation.
+
+---
+
+## 7. Memory Model
+
+`MemoryType` provides three memory representations:
+
+```cpp
+void *addr_h;   // Host memory
+void *addr_d;   // Conventional CUDA device memory
+void *addr_s;   // NVSHMEM symmetric GPU memory
+```
+
+The generic communication path can use host and conventional CUDA buffers, while the optimized all-NVSHMEM path performs the N-body computation directly with symmetric GPU allocations where appropriate.
+
+This design allows the project to maintain a common communication abstraction while also supporting an optimized NVSHMEM-specific execution strategy.
+
+---
+
+## 8. Numerical Validation
+
+The benchmark includes an independent **sampled numerical validation** implemented in `HPC_api.c` through:
+
+```cpp
+reference_force()
+validate_nbody_sampled()
+```
+
+Validation is executed by rank 0 **after the timed benchmark iterations**, so the CPU reference calculation does not affect the reported execution time.
+
+The current configuration uses:
+
+```cpp
+const int validation_samples = 16;
+const double rel_tolerance = 1.0e-10;
+const double abs_tolerance = 1.0e-12;
+```
+
+The sampled body indices are deterministically distributed from `0` to `number_of_bodies - 1`. For each selected body, `reference_force()` independently recomputes the complete N-body force on the CPU and accumulates the reference result using `long double` arithmetic.
+
+The GPU and CPU results are compared using the vector force error:
+
+$$
+E_{abs}=\sqrt{(F_x^{GPU}-F_x^{ref})^2+(F_y^{GPU}-F_y^{ref})^2}
+$$
+
+with the acceptance condition
+
+$$
+E_{abs} \leq \epsilon_{abs}+\epsilon_{rel}\lVert F^{ref}\rVert.
+$$
+
+The validator reports:
+
+```text
+Numerical validation (16 sampled bodies)
+  Relative tolerance : ...
+  Absolute tolerance : ...
+  Max absolute error : ...
+  Max relative error : ...
+  Relative L2 error  : ...
+  Worst sample index : ...
+  Result             : PASS / FAIL
+```
+
+The relative L2 error over the sampled force vectors is also reported:
+
+$$
+E_{L2}=\frac{\lVert F^{GPU}-F^{ref}\rVert_2}{\lVert F^{ref}\rVert_2}.
+$$
+
+This validation checks numerical consistency without introducing the full $O(N^2)$ CPU validation cost for every body.
 
 ---
 
 ## 9. Source Files
 
-The project is organized around:
+The current project contains:
 
 ```text
 .
@@ -488,84 +338,92 @@ The project is organized around:
 ├── n_body.c
 ├── n_body_kernel.cu
 ├── makefile
-├── script-execution-1node-4GPUs.sh
 └── README.md
 ```
 
 ### `HPC_api.h`
 
-Defines:
-
-- `M`, `C`, `N`, and `S` communication types;
-- supported data types;
-- host, CUDA, and NVSHMEM symmetric memory descriptors;
-- MPI/NCCL communicator information;
-- MPI/NVSHMEM process information;
-- GPU device information;
-- communication API prototypes.
+Defines communication codes, data types, memory descriptors, process/communicator structures, communication API prototypes, and the numerical-validation interfaces.
 
 ### `HPC_api.c`
 
-Implements:
+Implements MPI/NVSHMEM initialization, NCCL communicator setup, memory management, generic communication operations, and numerical validation:
 
 ```text
 SCATTER()
 BROADCAST()
 BROADCAST_PROC()
 GATHER()
+reference_force()
+validate_nbody_sampled()
 ```
-
-as well as:
-
-- MPI/NVSHMEM initialization;
-- MPI/NVSHMEM rank mapping verification;
-- NCCL communicator creation;
-- host/CUDA/NVSHMEM memory allocation;
-- host/device memory transfers;
-- NVSHMEM symmetric-memory transfers;
-- communicator destruction.
 
 ### `n_body.c`
 
-Implements:
-
-- command-line validation;
-- process/GPU initialization;
-- global and local particle allocation;
-- particle initialization;
-- initial data distribution;
-- local/remote partition traversal;
-- force-buffer initialization;
-- CUDA-kernel invocation;
-- force collection;
-- benchmark timing;
-- average execution-time calculation.
+Implements command-line processing, GPU/process initialization, benchmark orchestration, the generic N-body path, and the optimized `n_body_nvshmem()` path with asynchronous prefetching and double buffering.
 
 ### `n_body_kernel.cu`
 
-Implements the CUDA N-body force kernel.
+Implements the shared-memory tiled CUDA N-body force kernel.
 
-### `script-execution-1node-4GPUs.sh`
+### `makefile`
 
-Runs the supplied four-GPU benchmark configurations for multiple problem sizes.
+Builds the MPI/CUDA/NCCL/NVSHMEM executable using `mpic++` and `nvcc`.
 
 ---
 
-## 10. Command-Line Arguments
+## 10. Compilation
+
+The Makefile obtains CUDA, NCCL, and NVSHMEM paths from:
+
+```text
+CUDA_HOME
+NCCL_HOME
+NVSHMEM_HOME
+```
+
+The current CUDA target is NVIDIA Volta (`sm_70`), appropriate for Tesla V100 GPUs:
+
+```text
+-gencode=arch=compute_70,code=sm_70
+```
+
+On the Sequana environment, load the required modules, including NVSHMEM, before compiling. For example:
+
+```bash
+module load nvshmem/3.1.7_cuda-11.2_sequana
+make
+```
+
+The executable generated is:
+
+```text
+n_body
+```
+
+To remove generated objects and the executable:
+
+```bash
+make clean
+```
+
+---
+
+## 11. Command-Line Arguments
 
 The executable receives:
 
 ```text
-n_body <device_id> <number_of_bodies> <communication_configuration>
+./n_body <device_id> <number_of_bodies> <libraries>
 ```
 
 where:
 
 | Argument | Description |
-| -------- | ----------- |
-| `device_id` | CUDA device associated with the MPI process |
-| `number_of_bodies` | Global number of bodies |
-| `communication_configuration` | Exactly eight `M`, `C`, `N`, or `S` characters |
+|---|---|
+| `device_id` | CUDA GPU assigned to the MPI process |
+| `number_of_bodies` | Global number of bodies, e.g. `32768` |
+| `libraries` | Eight-character communication configuration |
 
 Example:
 
@@ -573,263 +431,140 @@ Example:
 ./n_body 0 32768 SSSSSSSS
 ```
 
-corresponds to:
-
-```text
-CUDA device       : 0
-Number of bodies  : 32768
-Communication     : NVSHMEM for all eight communication stages
-```
-
-Invalid configuration characters or strings whose length is not eight cause the program to abort.
+means GPU 0, 32,768 global bodies, and the optimized all-NVSHMEM path.
 
 ---
 
-## 11. Requirements
+## 12. Execution on One Node with Four GPUs
 
-The project requires an HPC environment containing:
-
-- NVIDIA GPUs;
-- CUDA Toolkit;
-- MPI;
-- CUDA-Aware MPI support for `C` experiments;
-- NCCL;
-- NVSHMEM;
-- a C/C++ compiler;
-- NVIDIA CUDA compiler (`nvcc`);
-- GNU Make or an equivalent build procedure.
-
-Because the communication API includes CUDA, NCCL, and NVSHMEM calls, the build must provide the corresponding header and library paths.
-
-The application links against the NVSHMEM library in addition to MPI, CUDA, and NCCL.
-
----
-
-## 12. Execution on One Node / Four GPUs
-
-A homogeneous four-GPU MPI execution can be launched using the MPMD syntax:
+MPI:
 
 ```bash
-mpirun \
-  -np 1 ./n_body 0 32768 MMMMMMMM : \
-  -np 1 ./n_body 1 32768 MMMMMMMM : \
-  -np 1 ./n_body 2 32768 MMMMMMMM : \
-  -np 1 ./n_body 3 32768 MMMMMMMM
+mpirun -np 1 ./n_body 0 32768 MMMMMMMM \
+     : -np 1 ./n_body 1 32768 MMMMMMMM \
+     : -np 1 ./n_body 2 32768 MMMMMMMM \
+     : -np 1 ./n_body 3 32768 MMMMMMMM
 ```
 
 CUDA-Aware MPI:
 
 ```bash
-mpirun \
-  -np 1 ./n_body 0 32768 CCCCCCCC : \
-  -np 1 ./n_body 1 32768 CCCCCCCC : \
-  -np 1 ./n_body 2 32768 CCCCCCCC : \
-  -np 1 ./n_body 3 32768 CCCCCCCC
+mpirun -np 1 ./n_body 0 32768 CCCCCCCC \
+     : -np 1 ./n_body 1 32768 CCCCCCCC \
+     : -np 1 ./n_body 2 32768 CCCCCCCC \
+     : -np 1 ./n_body 3 32768 CCCCCCCC
 ```
 
 NCCL:
 
 ```bash
-mpirun \
-  -np 1 ./n_body 0 32768 NNNNNNNN : \
-  -np 1 ./n_body 1 32768 NNNNNNNN : \
-  -np 1 ./n_body 2 32768 NNNNNNNN : \
-  -np 1 ./n_body 3 32768 NNNNNNNN
+mpirun -np 1 ./n_body 0 32768 NNNNNNNN \
+     : -np 1 ./n_body 1 32768 NNNNNNNN \
+     : -np 1 ./n_body 2 32768 NNNNNNNN \
+     : -np 1 ./n_body 3 32768 NNNNNNNN
 ```
 
-NVSHMEM follows the same application-level argument structure:
+NVSHMEM:
 
 ```bash
-mpirun \
-  -np 1 ./n_body 0 32768 SSSSSSSS : \
-  -np 1 ./n_body 1 32768 SSSSSSSS : \
-  -np 1 ./n_body 2 32768 SSSSSSSS : \
-  -np 1 ./n_body 3 32768 SSSSSSSS
+mpirun -np 1 ./n_body 0 32768 SSSSSSSS \
+     : -np 1 ./n_body 1 32768 SSSSSSSS \
+     : -np 1 ./n_body 2 32768 SSSSSSSS \
+     : -np 1 ./n_body 3 32768 SSSSSSSS
 ```
 
-The exact MPI/NVSHMEM launcher requirements may depend on the NVSHMEM and MPI installation used by the target HPC system.
+Thus, four MPI processes are launched and each process is explicitly associated with one NVIDIA GPU.
 
 ---
 
-## 13. Supplied Benchmark Script
+## 13. Performance Measurement
 
-The supplied script currently evaluates:
+The application executes ten benchmark iterations. Each iteration is timed with `MPI_Wtime()` around the complete `n_body()` execution and synchronized across processes.
 
-```text
-32768
-65536
-131072
-262144
-```
-
-using:
-
-```text
-MMMMMMMM
-CCCCCCCC
-NNNNNNNN
-```
-
-on one node with four GPUs.
-
-Its execution pattern is:
-
-```bash
-bash script-execution-1node-4GPUs.sh
-```
-
-and the results are redirected to separate files for MPI, CUDA-Aware MPI, and NCCL.
-
-Although `n_body.c` and `HPC_api.c` already implement the `S` configuration. It can be added when the NVSHMEM runtime/launcher configuration of the target system has been validated.
-
----
-
-## 14. Performance Measurement
-
-The application executes:
-
-```text
-10 benchmark iterations
-```
-
-for each invocation.
-
-Timing is performed around `n_body()` using:
-
-```cpp
-MPI_Wtime()
-```
-
-The sequence is:
-
-```text
-MPI_Barrier
-    |
-    v
-start = MPI_Wtime()
-    |
-    v
-n_body(...)
-    |
-    v
-cudaDeviceSynchronize()
-    |
-    v
-MPI_Barrier
-    |
-    v
-stop = MPI_Wtime()
-```
-
-Each process calculates its local elapsed time.
-
-The benchmark then uses:
+The local elapsed times are reduced with:
 
 ```cpp
 MPI_Reduce(..., MPI_MAX, ...)
 ```
 
-so rank 0 records the execution time of the slowest participating MPI process for that iteration.
-
-The reported result is the average of the ten reduced execution times:
+so rank 0 uses the slowest process time for each iteration. The final reported execution time is the average of the ten reduced times:
 
 ```text
 N-Body | Libraries=SSSSSSSS | Bodies=32768 | Average Time (s): ...
 ```
 
+Numerical validation is performed only after these timed iterations and therefore is not included in the benchmark result.
+
 ---
 
-## 15. Communication and Data-Locality Perspective
+## 14. Research Perspective
 
-The benchmark separates two fundamental components:
+The benchmark separates two fundamental aspects of distributed multi-GPU execution:
 
 ```text
-N-body computation
-        +
-communication/data movement
+GPU computation
+      +
+communication / data movement
+      =
+effective application performance
 ```
 
-The CUDA force kernel remains conceptually the same while the communication mechanism changes.
+It provides a common N-body workload for investigating:
 
-This enables experiments involving:
-
-- host-mediated MPI communication;
+- MPI host-mediated communication;
 - CUDA-Aware MPI;
-- NCCL collective communication;
+- NCCL collectives;
 - NVSHMEM symmetric memory;
-- one-sided GPU data access;
-- local versus remote particle data;
-- communication cost;
-- data movement;
-- communication/computation balance;
+- one-sided GPU communication;
+- asynchronous remote data movement;
+- shared-memory CUDA tiling;
+- double buffering;
+- communication/computation overlap;
+- local versus remote GPU data;
+- data locality;
 - multi-GPU scaling.
 
-The NVSHMEM path introduces an especially relevant distinction.
-
-With collective communication:
+The optimized NVSHMEM path is particularly relevant to data-locality research because the consumer explicitly fetches remote data and can overlap this movement with useful computation:
 
 ```text
-Data owner
-    |
-    | collective communication
-    v
-Consumers
+Where is the data?
+       |
+       +--> local  --> compute directly
+       |
+       +--> remote --> asynchronous GET --> compute
 ```
 
-With the current NVSHMEM implementation:
-
-```text
-Consumer
-    |
-    | one-sided GET
-    v
-Remote symmetric data
-```
-
-Therefore, the benchmark can be used to investigate not only **which communication library is faster**, but also how the **communication model and location of the data** affect effective application performance.
+The current owner traversal remains deterministic; therefore, the project provides a foundation for future **data-locality-aware task scheduling**, where the order of computation can be selected according to data location and communication cost.
 
 ---
 
-## 16. Current NVSHMEM Design
+## 15. Experimental Interpretation
 
-The present implementation should be interpreted as a **NVSHMEM version** designed to preserve the existing CUDA computational kernel.
+The homogeneous NVSHMEM implementation is more than a direct replacement of one communication API by another. It additionally uses an optimized pipeline with asynchronous GET operations, CUDA streams, events, and double buffering.
 
-Its path is conceptually:
+Consequently, comparisons such as:
 
 ```text
-CUDA memory
-     |
-     | device-to-device copy
-     v
-NVSHMEM symmetric memory
-     |
-     | nvshmem_double_get
-     v
-Remote/local symmetric memory
-     |
-     | device-to-device copy
-     v
-CUDA memory
-     |
-     v
-N-body CUDA kernel
+MPI vs CUDA-Aware MPI vs NCCL vs optimized NVSHMEM
 ```
 
-This design has two advantages for experimental comparison:
+measure the performance of the **implemented communication strategies as a whole**. They should not be interpreted as an isolated measurement of raw transport performance between the four libraries.
 
-1. the same N-body CUDA kernel can be preserved;
-2. the communication mechanism can be changed independently of the computation.
+For a controlled study of the overlap contribution, a useful extension is to compare:
 
-At the same time, the extra transfers between `addr_d` and `addr_s` are part of the current NVSHMEM implementation and can affect measured performance.
+```text
+NVSHMEM baseline (communication followed by computation)
+                         vs
+NVSHMEM optimized (double buffering + communication/computation overlap)
+```
 
-Therefore, results should be interpreted as measurements of the **complete communication strategy implemented by this version**, rather than as a measurement of the raw NVSHMEM transport alone.
-
+This separates the effect of the communication API from the effect of the pipelined execution strategy.
 
 ---
 
-## 17. Research Motivation
+## 16. Research Motivation
 
-As GPU computational capability increases, effective application performance depends not only on GPU arithmetic throughput, but also on the relationship between:
+As GPU computational capability increases, performance increasingly depends on the relationship among computation, communication, and data placement:
 
 ```text
 Where are the data?
@@ -838,20 +573,11 @@ How must the data move?
         +
 Which communication mechanism is used?
         +
-What execution architecture connects the GPUs?
+Can communication overlap computation?
         =
 Effective Application Performance
 ```
 
-The present benchmark provides a controlled environment for studying part of this relationship by keeping the computational workload stable while varying the communication mechanism among:
+The project therefore serves as an experimental platform for research involving:
 
-```text
-MPI
-CUDA-Aware MPI
-NCCL
-NVSHMEM
-```
-
-This makes the application suitable as a foundation for research on:
-
-**Distributed Multi-GPU Computing · Data Locality · GPU Communication · MPI · CUDA-Aware MPI · NCCL · NVSHMEM · N-Body Simulation · High-Performance Computing**.
+**Distributed Multi-GPU Computing · Data Locality · GPU Communication · MPI · CUDA-Aware MPI · NCCL · NVSHMEM · Communication/Computation Overlap · N-Body Simulation · High-Performance Computing**.

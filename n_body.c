@@ -1,3 +1,70 @@
+/******************************************************************************
+ *
+ * Distributed Multi-GPU N-Body Benchmark
+ *
+ * Description:
+ *   Distributed N-Body benchmark for evaluating different communication
+ *   libraries in multi-GPU systems.
+ *
+ *   The application distributes the N-Body computation across multiple GPUs,
+ *   using one MPI process per GPU. Each GPU computes the forces associated
+ *   with its local subset of bodies while data required from other GPUs is
+ *   exchanged through the selected communication library.
+ *
+ *   Supported communication libraries. The eight-character argument specifies
+ *   the communication library used by the benchmark. For example:
+ *
+ *     MMMMMMMM = MPI
+ *     CCCCCCCC = CUDA-Aware MPI
+ *     NNNNNNNN = NCCL
+ *     SSSSSSSS = NVSHMEM
+ *
+ * Compilation:
+ *
+ *   [murilo.boratto@sdumont]$ module load nvshmem/3.1.7_cuda-11.2_sequana
+ *
+ *   [murilo.boratto@sdumont]$ make
+ *
+ * Execution:
+ *
+ *   Example using one node with four GPUs and one MPI process per GPU:
+ *
+ *   [murilo.boratto@sdumont]$ mpirun -np 1 ./n_body 0 32768 MMMMMMMM \
+ *                                  : -np 1 ./n_body 1 32768 MMMMMMMM \
+ *                                  : -np 1 ./n_body 2 32768 MMMMMMMM \
+ *                                  : -np 1 ./n_body 3 32768 MMMMMMMM
+ *
+ * Arguments:
+ *
+ *   ./n_body <device_id> <number_of_bodies> <libraries>
+ *
+ *   where:
+ *
+ *     device_id         = CUDA GPU device assigned to the MPI process
+ *     number_of_bodies  = total number of bodies (e.g., 32768)
+ *     libraries         = communication library combination
+ *                         (MMMMMMMM, CCCCCCCC, NNNNNNNN, SSSSSSSS)
+ *
+ *   In the example above:
+ *
+ *     MPI Rank 0 -> GPU 0
+ *     MPI Rank 1 -> GPU 1
+ *     MPI Rank 2 -> GPU 2
+ *     MPI Rank 3 -> GPU 3
+ *
+ *   Therefore, four MPI processes are launched, each associated with one
+ *   NVIDIA GPU.
+ *
+ *   The NVSHMEM implementation uses one-sided GPU communication, asynchronous
+ *   data transfers, CUDA streams, and double buffering to overlap
+ *   communication with computation.
+ *
+ *   Numerical validation is performed independently from the benchmark timing
+ *   by comparing sampled GPU-computed forces against a CPU reference
+ *   implementation.
+ *
+ ******************************************************************************/
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,10 +79,9 @@
 
 #define TILE_DIM 256
 
-extern void calculate_force(double *posXl, double *posYl, double *massl,
-                            double *forceX, double *forceY,
-                            double *auxPosX, double *auxPosY, double *auxMass,
-                            int size, int cond, int w, cudaStream_t stream);
+extern void calculate_force(double *posXl, double *posYl, double *massl, double *forceX, double *forceY,
+                            double *auxPosX, double *auxPosY, double *auxMass, int size, int cond, int w, 
+                            cudaStream_t stream);
 
 static int all_nvshmem(const char *libraries)
 {
@@ -72,10 +138,12 @@ static void n_body_nvshmem(MemoryType posX, MemoryType posXl, MemoryType remoteP
     }
 
     nvshmem_barrier_all();
+    
     nvshmemx_double_get_nbi_on_stream((double *)posXl.addr_s, (double *)posX.addr_s + offset, local_size, 0, comm.comm_stream);
     nvshmemx_double_get_nbi_on_stream((double *)posYl.addr_s, (double *)posY.addr_s + offset, local_size, 0, comm.comm_stream);
     nvshmemx_double_get_nbi_on_stream((double *)massl.addr_s, (double *)mass.addr_s + offset, local_size, 0, comm.comm_stream);
     nvshmemx_quiet_on_stream(comm.comm_stream);
+
     cudaStreamSynchronize(comm.comm_stream);
     nvshmem_barrier_all();
 
@@ -144,7 +212,6 @@ static void n_body_nvshmem(MemoryType posX, MemoryType posXl, MemoryType remoteP
         }
     }
 
-   
     cudaStreamSynchronize(comm.compute_stream);
 
     nvshmemx_double_put_nbi_on_stream((double *)forceX.addr_s + offset, (double *)forceXl.addr_s, local_size, 0, comm.comm_stream);
@@ -338,19 +405,22 @@ int main(int argc, char *argv[])
             }
         }
 
-       /************************************/
-       /**/  MPI_Barrier(MPI_COMM_WORLD);/**/
-       /**/  start = MPI_Wtime();        /**/
-       /************************************/
+        /* ================================================================ */
+        /* n-body                                                           */
+        /* ================================================================ */
+
+       //////////////////////////////////////
+            MPI_Barrier(MPI_COMM_WORLD);   
+               start = MPI_Wtime();       
+       //////////////////////////////////////
 
         n_body(posX, posXl, remotePosX, posY, posYl, remotePosY, mass, massl, remoteMass, forceX, forceXl, forceY, forceYl, proc, comm, communication_libraries);
 
-       /************************************/
-       /**/  MPI_Barrier(MPI_COMM_WORLD);/**/
-       /**/  stop = MPI_Wtime();         /**/ 
-       /************************************/
+       //////////////////////////////////////
+            MPI_Barrier(MPI_COMM_WORLD);
+                stop = MPI_Wtime();          
+       //////////////////////////////////////
         
-
         local_time = stop - start;
 
         MPI_Reduce(&local_time, 
@@ -368,8 +438,30 @@ int main(int argc, char *argv[])
     avg_time = total_time / (double)loop_count;
 
     if (proc.currentRank == 0)
+    {
         printf("\nN-Body | Libraries=%s | Bodies=%d | Average Time (s): %8.6f\n", communication_libraries, number_of_bodies, avg_time);
 
+        const int validation_samples = 16;
+        const double rel_tolerance = 1.0e-10;
+        const double abs_tolerance = 1.0e-12;
+
+    /* ------------------------------------------------------------------ */
+    /* Numerical validation                                               */
+    /* ------------------------------------------------------------------ */
+
+             validate_nbody_sampled(&posX, &posY, &mass,
+                                    &forceX, &forceY,
+                                    number_of_bodies,
+                                    validation_samples,
+                                    rel_tolerance,
+                                    abs_tolerance);
+        
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Cleanup: free only buffers that were actually allocated.           */
+    /* ------------------------------------------------------------------ */
+    
     freeMemory(&mass);
     freeMemory(&posX);
     freeMemory(&posY);

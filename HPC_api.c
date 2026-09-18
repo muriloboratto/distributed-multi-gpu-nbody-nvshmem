@@ -1,5 +1,6 @@
 #include "HPC_api.h"
 #include <string.h>
+#include <math.h>
 
 static void copy_d_to_s(MemoryType *mem)
 {
@@ -294,4 +295,125 @@ void GATHER(OperationType type, MemoryType *mem, MemoryType *res, ProcessInforma
             fprintf(stderr, "GATHER: invalid communication type\n");
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
+}
+
+
+/* Numerical validation */
+
+void reference_force(const double *posX,
+                            const double *posY,
+                            const double *mass,
+                            int n,
+                            int target,
+                            double *fx,
+                            double *fy)
+{
+    const double px = posX[target];
+    const double py = posY[target];
+    long double sumX = 0.0L;
+    long double sumY = 0.0L;
+
+    for (int j = 0; j < n; ++j)
+    {
+        if (j == target)
+            continue;
+
+        const long double dx = (long double)px - (long double)posX[j];
+        const long double dy = (long double)py - (long double)posY[j];
+        const long double d2 = dx * dx + dy * dy;
+
+        if (d2 == 0.0L)
+            continue;
+
+        const long double inv_d = 1.0L / sqrtl(d2);
+        const long double inv_d3 = inv_d * inv_d * inv_d;
+
+        sumX += dx * (long double)mass[j] * inv_d3;
+        sumY += dy * (long double)mass[j] * inv_d3;
+    }
+
+    *fx = (double)sumX;
+    *fy = (double)sumY;
+}
+
+int validate_nbody_sampled(const MemoryType *posX,
+                           const MemoryType *posY,
+                           const MemoryType *mass,
+                           const MemoryType *forceX,
+                           const MemoryType *forceY,
+                           int number_of_bodies,
+                           int max_samples,
+                           double rel_tolerance,
+                           double abs_tolerance)
+{
+    const double *x = (const double *)posX->addr_h;
+    const double *y = (const double *)posY->addr_h;
+    const double *m = (const double *)mass->addr_h;
+    const double *gpuFx = (const double *)forceX->addr_h;
+    const double *gpuFy = (const double *)forceY->addr_h;
+
+    if (!x || !y || !m || !gpuFx || !gpuFy || number_of_bodies <= 0)
+    {
+        fprintf(stderr, "VALIDATION ERROR: invalid host data.\n");
+        return 0;
+    }
+
+    int samples = max_samples;
+    if (samples < 1)
+        samples = 1;
+    if (samples > number_of_bodies)
+        samples = number_of_bodies;
+
+    double max_abs_error = 0.0;
+    double max_rel_error = 0.0;
+    int worst_index = 0;
+    int failures = 0;
+
+    long double ref_norm2 = 0.0L;
+    long double err_norm2 = 0.0L;
+
+    for (int s = 0; s < samples; ++s)
+    {
+        const int i = (samples == 1)
+                    ? 0
+                    : (int)(((long long)s * (number_of_bodies - 1)) / (samples - 1));
+
+        double refFx = 0.0, refFy = 0.0;
+        reference_force(x, y, m, number_of_bodies, i, &refFx, &refFy);
+
+        const double ex = gpuFx[i] - refFx;
+        const double ey = gpuFy[i] - refFy;
+        const double abs_error = hypot(ex, ey);
+        const double ref_mag = hypot(refFx, refFy);
+        const double rel_error = abs_error / fmax(ref_mag, abs_tolerance);
+        const double allowed = abs_tolerance + rel_tolerance * ref_mag;
+
+        ref_norm2 += (long double)refFx * refFx + (long double)refFy * refFy;
+        err_norm2 += (long double)ex * ex + (long double)ey * ey;
+
+        if (abs_error > max_abs_error)
+        {
+            max_abs_error = abs_error;
+            worst_index = i;
+        }
+        if (rel_error > max_rel_error)
+            max_rel_error = rel_error;
+
+        if (!isfinite(gpuFx[i]) || !isfinite(gpuFy[i]) || abs_error > allowed)
+            ++failures;
+    }
+
+    const double relative_l2 = sqrt((double)err_norm2) /
+                               fmax(sqrt((double)ref_norm2), abs_tolerance);
+
+    printf("\nNumerical validation (%d sampled bodies)\n", samples);
+    printf("  Relative tolerance : %.3e\n", rel_tolerance);
+    printf("  Absolute tolerance : %.3e\n", abs_tolerance);
+    printf("  Max absolute error : %.6e\n", max_abs_error);
+    printf("  Max relative error : %.6e\n", max_rel_error);
+    printf("  Relative L2 error  : %.6e\n", relative_l2);
+    printf("  Worst sample index : %d\n", worst_index);
+    printf("  Result             : %s\n", failures == 0 ? "PASS" : "FAIL");
+
+    return failures == 0;
 }
